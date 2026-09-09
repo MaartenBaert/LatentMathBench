@@ -35,8 +35,8 @@ attends to the resulting K/V state of token `t-1`, there is a causal path like:
 -> ...
 ```
 
-Thus, although each token receives at most 10 recurrent passes, the opaque serial depth[2] of
-the computation can grow with sequence length. Tokens are still required to provide space for
+Thus, although each token receives at most 10 recurrent passes, the [opaque serial depth](https://arxiv.org/abs/2603.09786)
+of the computation can grow with sequence length. Tokens are still required to provide space for
 long reasoning, but the reasoning itself does not have to pass through the CoT. The CoT tokens
 could be arbitrary filler, while the true reasoning happens in the shared KV-cache.
 
