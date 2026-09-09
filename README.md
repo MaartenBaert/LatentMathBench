@@ -4,4 +4,4 @@
 
 [Motivation and benchmark results](docs/index.md)
 
-Credits to [Rohan Sobramani](https://rohansubramani.github.io/astra-no-cot/) for coming up with the idea of using a well-crafted system prompt + reasoning token monitoring via the API to suppress chain-of-thought reasoning for GPT-6 Astra.
+Credits to [Rohan Subramani](https://rohansubramani.github.io/astra-no-cot/) for coming up with the idea of using a well-crafted system prompt + reasoning token monitoring via the API to suppress chain-of-thought reasoning for GPT-6 Astra.

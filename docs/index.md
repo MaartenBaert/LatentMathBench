@@ -51,7 +51,7 @@ like the one above. How would such an LLM behave? We can expect that, with limit
 the LLM might be unusually good at performing long chains of simple sequential reasoning steps.
 
 *LatentMathBench* was designed specifically to elicit this type of reasoning in latent space in LLMs
-that would support such reasoning. It is inspired by [Rohan Sobramani's benchmark](https://rohansubramani.github.io/astra-no-cot/), but focuses on long chains of simple math rather than knowledge questions.
+that would support such reasoning. It is inspired by [Rohan Subramani's benchmark](https://rohansubramani.github.io/astra-no-cot/), but focuses on long chains of simple math rather than knowledge questions.
 
 This benchmark generates random sequential tasks such as:
 
