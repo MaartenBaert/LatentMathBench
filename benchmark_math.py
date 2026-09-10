@@ -1,5 +1,7 @@
 import argparse
+import math
 import random
+import time
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -8,6 +10,94 @@ MIN_VALUE = 1
 MAX_VALUE = 9
 OPERATORS = ("+", "-", "*", "//")
 SYSTEM_PROMPT = "Do not reason, deliberate, or work anything out. Emit the final answer on your very first token. No explanation, no steps, no scratch work."
+
+
+class BernoulliSPRT:
+    """
+    Sequential test of:
+
+        LOW:  p <= p_low
+        HIGH: p >= p_high
+
+    No error guarantee is made when p_low < p < p_high.
+    """
+
+    def __init__(
+        self,
+        p_low=0.4,
+        p_high=0.6,
+        alpha=0.05,
+        beta=0.05,
+        max_trials=None,
+    ):
+        if not 0 < p_low < p_high < 1:
+            raise ValueError("Require 0 < p_low < p_high < 1.")
+        if not 0 < alpha < 1 or not 0 < beta < 1:
+            raise ValueError("alpha and beta must be between 0 and 1.")
+
+        self.p_low = p_low
+        self.p_high = p_high
+        self.alpha = alpha
+        self.beta = beta
+        self.max_trials = max_trials
+
+        # Per-observation log likelihood-ratio increments:
+        # log[P(X | p_high) / P(X | p_low)]
+        self.llr_success = math.log(p_high / p_low)
+        self.llr_failure = math.log(
+            (1.0 - p_high) / (1.0 - p_low)
+        )
+
+        # Conservative anytime-valid thresholds.
+        #
+        # Under p <= p_low:
+        #   P(ever selecting HIGH) <= alpha
+        #
+        # Under p >= p_high:
+        #   P(ever selecting LOW) <= beta
+        self.upper_log_bound = math.log(1.0 / alpha)
+        self.lower_log_bound = math.log(beta)
+
+        self.trials = 0
+        self.successes = 0
+        self.log_likelihood_ratio = 0.0
+        self.status = "CONTINUE"
+
+    def step(self, outcome):
+        if self.status != "CONTINUE":
+            return self.status
+
+        if outcome not in (0, 1, False, True):
+            raise ValueError("Outcome must be 0 or 1.")
+
+        outcome = int(outcome)
+        self.trials += 1
+        self.successes += outcome
+
+        if outcome == 1:
+            self.log_likelihood_ratio += self.llr_success
+        else:
+            self.log_likelihood_ratio += self.llr_failure
+
+        if self.log_likelihood_ratio >= self.upper_log_bound:
+            self.status = "HIGH: evidence for p >= p_high"
+        elif self.log_likelihood_ratio <= self.lower_log_bound:
+            self.status = "LOW: evidence for p <= p_low"
+        elif (
+            self.max_trials is not None
+            and self.trials >= self.max_trials
+        ):
+            # Do not force a decision without separately calibrating
+            # the resulting error probabilities.
+            self.status = "INCONCLUSIVE"
+
+        return self.status
+
+    @property
+    def sample_proportion(self):
+        if self.trials == 0:
+            return None
+        return self.successes / self.trials
 
 
 def apply_operator(left, operator, right):
@@ -25,7 +115,7 @@ def apply_operator(left, operator, right):
 
 
 def generate_calculation(
-    variable_count=6,
+    variable_count=4,
     step_count=10,
     seed=None,
     max_attempts=10000,
@@ -224,7 +314,15 @@ def run_test(llm, args, steps):
     print()
 
     history = [SystemMessage(SYSTEM_PROMPT), HumanMessage(prompt)]
-    response = llm.invoke(history)
+    while True:
+        try:
+            response = llm.invoke(history)
+            break
+        except Exception as e:
+            print(e)
+            print('Retrying in 10 seconds ...')
+            time.sleep(10)
+
     print(response)
     print()
 
@@ -233,6 +331,8 @@ def run_test(llm, args, steps):
     elif isinstance(response.content, list):
         if len(response.content) != 1:
             content = "(incorrect length list)"
+        elif "text" not in response.content[0]:
+            content = "(non-text response)"
         else:
             content = response.content[0]["text"]
     else:
@@ -246,7 +346,8 @@ def run_test(llm, args, steps):
     if "output_token_details" in response.usage_metadata:
         reasoning_tokens = response.usage_metadata["output_token_details"]["reasoning"]
     else:
-        reasoning_tokens = max(0, response.usage_metadata["output_tokens"] - 10)
+        reasoning_tokens = 0
+    reasoning_tokens += max(0, response.usage_metadata["output_tokens"] - 10)
     valid = reasoning_tokens == 0
 
     print(f"Model answer: {content}")
@@ -260,23 +361,32 @@ def run_test(llm, args, steps):
 
 def run_sample(llm, args, steps):
 
+    test = BernoulliSPRT(max_trials=args.repeats)
+
     score = 0
     invalid = 0
+    total = 0
     for rep in range(args.repeats):
         (correct, valid) = run_test(llm=llm, args=args, steps=steps)
         score += int(correct and valid)
         invalid += int(not valid)
+        total += 1
+        if args.horizon:
+            status = test.step(correct and valid)
+            if status != "CONTINUE":
+                print(test.status)
+                break
 
     print(f"Provider:      {args.provider}")
     print(f"Model:         {args.model}")
     print(f"Variables:     {args.variables}")
     print(f"Steps:         {steps}")
-    print(f"Total score:   {score} / {args.repeats}  ({100 * score // args.repeats}%)")
+    print(f"Total score:   {score} / {total}  ({100 * score // total}%)")
     print(
-        f"Total invalid: {invalid} / {args.repeats}  ({100 * invalid // args.repeats}%)"
+        f"Total invalid: {invalid} / {total}  ({100 * invalid // total}%)"
     )
 
-    return (score, invalid)
+    return (score, invalid, total)
 
 
 def main():
@@ -301,7 +411,7 @@ def main():
         "-r",
         "--repeats",
         type=int,
-        default=20,
+        default=50,
         help="number of times the test is repeated",
     )
     parser.add_argument(
@@ -351,7 +461,7 @@ def main():
     llm = init_chat_model(
         model_provider=args.provider,
         model=args.model,
-        max_tokens=1000,
+        max_tokens=100,
         **kwargs,
     )
 
@@ -359,8 +469,8 @@ def main():
         lo = 0
         hi = 1
         while True:
-            (score, invalid) = run_sample(llm=llm, args=args, steps=hi)
-            if score < args.repeats // 2:
+            (score, invalid, total) = run_sample(llm=llm, args=args, steps=hi)
+            if score * 2 < total:
                 break
             if hi >= 256:
                 lo = hi
@@ -369,8 +479,8 @@ def main():
             hi *= 2
         while hi - lo > 1:
             mid = (lo + hi) // 2
-            (score, invalid) = run_sample(llm=llm, args=args, steps=mid)
-            if score < args.repeats // 2:
+            (score, invalid, total) = run_sample(llm=llm, args=args, steps=mid)
+            if score * 2 < total:
                 hi = mid
             else:
                 lo = mid
