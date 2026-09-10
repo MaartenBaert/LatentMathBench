@@ -90,29 +90,45 @@ d = a + d # think: d is now ...
 What is the final value of d?
 ```
 
+Note that not every operation depends on the result of the preceding operation, so the number of steps
+should not be interpreted as strictly serial operations. The benchmark implicitly measures a combination
+of sequential and parallel calculation ability, along with the ability to distinguish the two.
+
 This test is performed *without* chain-of-thought reasoning. For models that do not support a
 no-reasoning mode (such as Astra), a system prompt is used to stop the model from using its
 chain-of-thought, and the benchmark verifies that the number of thinking tokens used is zero
 (if it is not, the answer is invalidated).
 
-The tasks are intentionally generated in such a way that all numeric values are between 1 and 9,
+The benchmark contains a few variations of this test:
+
+- **math-4** uses 4 variables, with operators `+`, `-`, `*` and `//`, and uses values between 1 and 9 (as in the example above).
+- **swap-4** uses 4 variables, only performs swaps (e.g. `a, b = b, a`), and uses values between 1 and 4.
+- **bitwise-4** uses 4 variables, with operators `+`, `-` and `^` (bitwise xor), and uses values between 0 and 15.
+
+# Benchmark results
+
+The tasks are intentionally generated in such a way that all numeric values remain small,
 so the LLM never has to work with large numbers. This does mean that the LLM has a 10-20% chance
 of guessing the correct answer by random chance, so that needs to be accounted for when
 interpreting the results.
-
-## The results
 
 The results are quite surprising! Compared to older OpenAI models, Astra is a clear outlier in
 terms of its ability to correctly execute long chains of simple calculations without using its
 chain-of-thought.
 
-![The task success rate (out of 20 trials), for several OpenAI models](benchmark-results.svg)
+![The task success rate for math-4 (out of 20 trials), for several OpenAI models](benchmark-result-math-4.svg)
 
-![The 50% success horizon, for several OpenAI and Anthropic models](benchmark-horizons.svg)
+50% task success horizons for the three task variations:
 
-The 50% success horizon for GPT-6 Astra is roughly 4x higher than the next best model (GPT-5.6 Sol),
-and 7x higher than GPT-4. That by itself doesn't prove anything, but it is surprising! At the very
-least, these results demonstrate that “depth of the computation graph” (however OpenAI defines this)
+![The 50% success horizon for math-4, for several OpenAI and Anthropic models](benchmark-horizon-math-4.svg)
+![The 50% success horizon for swap-4, for several OpenAI and Anthropic models](benchmark-horizon-swap-4.svg)
+![The 50% success horizon for bitwise-4, for several OpenAI and Anthropic models](benchmark-horizon-bitwise-4.svg)
+
+For the *math-4* variation, the 50% success horizon for GPT-6 Astra is roughly 4x higher than the next best OpenAI
+model (GPT-5.6 Sol), and 7x higher than GPT-4. The other variations show a similar pattern.
+
+That by itself doesn't prove anything, but it is surprising! At the very least,
+these results demonstrate that “depth of the computation graph” (however OpenAI defines this)
 is not a good proxy for sequential reasoning ability without CoT.
 
 Note: This benchmark doesn't work so well with Anthropic models, because Anthropic doesn't have a "no reasoning" mode for most of its models. The older models (e.g. Sonnet 4.5) often ignore the system prompt and try to use reasoning anyway. Newer models often try this too, but seemingly only when they reach the point where they can't answer reliably without thinking (presumably they don't want to guess).
