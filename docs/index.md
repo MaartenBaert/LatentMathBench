@@ -104,6 +104,7 @@ The benchmark contains a few variations of this test:
 - **math-4** uses 4 variables, with operators `+`, `-`, `*` and `//`, and uses values between 1 and 9 (as in the example above).
 - **swap-4** uses 4 variables, only performs swaps (e.g. `a, b = b, a`), and uses values between 1 and 4.
 - **bitwise-4** uses 4 variables, with operators `+`, `-` and `^` (bitwise xor), and uses values between 0 and 15.
+- **bitwise-1** is the same but with just one variable, creating a strictly serial chain of operations.
 
 # Benchmark results
 
@@ -123,6 +124,7 @@ chain-of-thought.
 ![The 50% success horizon for math-4, for several OpenAI and Anthropic models](benchmark-horizon-math-4.svg)
 ![The 50% success horizon for swap-4, for several OpenAI and Anthropic models](benchmark-horizon-swap-4.svg)
 ![The 50% success horizon for bitwise-4, for several OpenAI and Anthropic models](benchmark-horizon-bitwise-4.svg)
+![The 50% success horizon for bitwise-1, for several OpenAI and Anthropic models](benchmark-horizon-bitwise-1.svg)
 
 For the *math-4* variation, the 50% success horizon for GPT-6 Astra is roughly 4x higher than the next best OpenAI
 model (GPT-5.6 Sol), and 7x higher than GPT-4. The other variations show a similar pattern.
