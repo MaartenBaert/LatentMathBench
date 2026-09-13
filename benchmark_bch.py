@@ -454,6 +454,8 @@ def bch_to_logic(H, correct, displayed, rhs, number_wrong=2, phrasing='exactly')
         phrase = "These expressions may be incorrect and should be ignored:\n"
     elif phrasing == "boolean":
         phrase = "All variables are boolean.\n"
+    elif phrasing == "not":
+        phrase = "This is not a valid solution:\n"
     elif phrasing == "alternative":
         phrase = "This is a valid solution:\n"
     else:
@@ -461,6 +463,12 @@ def bch_to_logic(H, correct, displayed, rhs, number_wrong=2, phrasing='exactly')
 
     problem = "The following expressions are all correct:\n" + "\n".join(checks)
 
+    # if phrasing == "not":
+    #     return (
+    #         problem + "\n\n" +
+    #         phrase + f"{assignments}\n\n" +
+    #         f"What is the correct solution ({', '.join(names)})?"
+    #     )
     if phrasing == "alternative":
         return (
             problem + "\n\n" +
@@ -678,7 +686,7 @@ def main():
         "--phrasing",
         type=str,
         default="exactly",
-        choices=["exactly", "some", "ignore", "boolean", "alternative"],
+        choices=["exactly", "some", "ignore", "boolean", "not", "alternative"],
         help="change question phrasing to 'some of these are incorrect'",
     )
     parser.add_argument(
@@ -697,6 +705,8 @@ def main():
         default=None,
         help="add input dots (filler tokens)",
     )
+    parser.add_argument("--lo", type=int, default=None)
+    parser.add_argument("--hi", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -730,21 +740,24 @@ def main():
         )
 
     if args.horizon:
-        # One variable cannot contain the two errors required by the puzzle,
-        # so begin at the smallest supported variable count.
-        lo = 1
-        hi = 2
-        while True:
-            (score, invalid, total) = run_sample(
-                llm=llm, args=args, variables=hi
-            )
-            if score * 2 < total:
-                break
-            if hi >= 256:
+        if args.lo is not None and args.hi is not None:
+            lo, hi = args.lo, args.hi
+        else:
+            # One variable cannot contain the two errors required by the puzzle,
+            # so begin at the smallest supported variable count.
+            lo = 1
+            hi = 2
+            while True:
+                (score, invalid, total) = run_sample(
+                    llm=llm, args=args, variables=hi
+                )
+                if score * 2 < total:
+                    break
+                if hi >= 256:
+                    lo = hi
+                    break
                 lo = hi
-                break
-            lo = hi
-            hi *= 2
+                hi *= 2
         while hi - lo > 1:
             mid = (lo + hi) // 2
             (score, invalid, total) = run_sample(
