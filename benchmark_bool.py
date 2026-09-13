@@ -247,10 +247,95 @@ def generate_calculation(
         # if not all(ever_used.values()):
         #     continue
 
-        return variable_names, initial_values, operations
+        return variable_names, initial_values, operations, rng
 
     raise RuntimeError(
         "Could not generate a calculation. Try fewer steps or variables."
+    )
+
+
+def static_single_assignment(
+    variable_count, variable_names, initial_values, operations
+):
+    """
+    Convert the generated operations to SSA-style variable names.
+
+    For example, repeated assignments to ``a`` become ``a1``, ``a2``, etc.
+    The initial value of every variable is represented by version ``0``.
+
+    The generated operation format remains:
+
+        (destination, left, operator, right, values)
+
+    Since the generator performs:
+
+        destination ^= (left operator right)
+
+    the previous version of ``destination`` is implicitly the source value
+    used by that assignment.
+    """
+    if len(variable_names) != variable_count:
+        raise ValueError("variable_names does not match variable_count.")
+
+    if len(initial_values) != variable_count:
+        raise ValueError("initial_values does not match variable_count.")
+
+    # Current SSA version for each original variable.
+    versions = {name: 0 for name in variable_names}
+
+    # Names corresponding to the initial values.
+    initial_variable_names = [
+        f"{name}0" for name in variable_names
+    ]
+
+    # Current SSA name for each original variable.
+    current_names = dict(zip(variable_names, initial_variable_names))
+
+    ssa_operations = []
+
+    for operation in operations:
+        if len(operation) != 5:
+            raise ValueError(f"Invalid operation: {operation!r}")
+
+        destination, left, operator, right, values = operation
+
+        for name in (destination, left, right):
+            if name not in current_names:
+                raise ValueError(
+                    f"Unknown variable {name!r} in operation {operation!r}"
+                )
+
+        # Operands refer to the versions that exist before this assignment.
+        ssa_left = current_names[left]
+        ssa_right = current_names[right]
+
+        # Every assignment creates a new version of its destination.
+        versions[destination] += 1
+        ssa_destination = (
+            f"{destination}{versions[destination]}"
+        )
+
+        ssa_operations.append(
+            (
+                ssa_destination,
+                ssa_left,
+                operator,
+                ssa_right,
+                values,
+            )
+        )
+
+        current_names[destination] = ssa_destination
+
+    final_variable_names = [
+        current_names[name] for name in variable_names
+    ]
+
+    return (
+        initial_variable_names,
+        final_variable_names,
+        initial_values,
+        ssa_operations,
     )
 
 
@@ -326,7 +411,7 @@ def speculative_depth(
 def run_test(llm, args, steps):
 
     while True:
-        variable_names, initial_values, operations = generate_calculation(
+        variable_names, initial_values, operations, rng = generate_calculation(
             variable_count=args.variables,
             step_count=steps,
         )
@@ -345,6 +430,17 @@ def run_test(llm, args, steps):
     print(f"Speculative depth: {sd}")
     print()
 
+    if args.ssa:
+        initial_variable_names, final_variable_names, initial_values, operations = static_single_assignment(
+            variable_count=args.variables,
+            variable_names=variable_names,
+            initial_values=initial_values,
+            operations=operations,
+        )
+    else:
+        initial_variable_names = variable_names
+        final_variable_names = variable_names
+
     lines = []
 
     lines.append("This task tests your ability to do long sequences of mental math.")
@@ -353,26 +449,36 @@ def run_test(llm, args, steps):
     )
     lines.append("")
 
-    for name, value in zip(variable_names, initial_values):
+    for name, value in zip(initial_variable_names, initial_values):
         lines.append(f"{name} = {value}")
 
     lines.append("")
-    
-    ordered_vars = variable_names.copy()
-    
+
+    lines2 = []
+    ordered_vars = initial_variable_names.copy()
     for destination, left, operator, right, result in operations:
-        lines.append(
-            f"{destination} = {destination} xor ({left} {operator} {right})"
-            f"  # think: {destination} is now ..."
+        old_destination = f"{destination[:1]}{int(destination[1 :])-1}" if args.ssa else destination
+        lines2.append(
+            f"{destination} = {old_destination} xor ({left} {operator} {right})" +
+            ("" if args.shuffle else f"  # think: {destination} is now ...")
         )
-        ordered_vars.remove(destination)
+        ordered_vars.remove(old_destination)
         ordered_vars.append(destination)
 
-    allvars = ", ".join(reversed(ordered_vars))
-    expect = tuple(result[variable_names.index(x)] for x in reversed(ordered_vars))
+    if args.shuffle:
+        rng.shuffle(lines2)
 
-    lines.append("")
+    for rep in range(1 if args.input_repeat is None else args.input_repeat):
+        lines.extend(lines2)
+        lines.append("")
+
+    allvars = ", ".join(reversed(ordered_vars))
+    expect = tuple(result[variable_names.index(x[:1])] for x in reversed(ordered_vars))
+
     lines.append(f"What is the final value of ({allvars})?")
+
+    if args.input_dots is not None:
+        lines.append(". " * args.input_dots)
 
     prompt = "\n".join(lines)
     print(prompt)
@@ -514,10 +620,32 @@ def main():
         help="run without doing LLM calls (response is always empty)",
     )
     parser.add_argument(
+        "--ssa",
+        action="store_true",
+        help="use static single-assignment",
+    )
+    parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="shuffle order of assignments",
+    )
+    parser.add_argument(
         "--speculative-depth",
         type=int,
         default=None,
         help="require a specific speculative depth"
+    )
+    parser.add_argument(
+        "--input-dots",
+        type=int,
+        default=None,
+        help="add input dots (filler tokens)",
+    )
+    parser.add_argument(
+        "--input-repeat",
+        type=int,
+        default=None,
+        help="repeat input several times",
     )
 
     args = parser.parse_args()
