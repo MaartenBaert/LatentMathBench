@@ -248,35 +248,85 @@ def _random_row_mix(H, rng):
     return H
 
 
-def random_bch2_parity_check(r, rng=None):
+def _balanced_random_row_mix(H, rng, candidates):
     """
-    Construct a randomized binary two-error-correcting BCH matrix.
+    Return the best of several random invertible row mixes.
+
+    Rows with between three and half of the variables have no penalty.
+    Outside that interval, the squared distance to the nearest boundary is
+    penalized. Equal-scoring candidates are selected uniformly at random.
+    """
+    if isinstance(candidates, bool) or not isinstance(
+        candidates, (int, np.integer)
+    ):
+        raise TypeError("candidates must be an integer")
+    if candidates < 1:
+        raise ValueError("candidates must be at least 1")
+
+    variable_count = H.shape[1]
+    upper = variable_count // 2
+    lower = min(3, upper)
+
+    best = None
+    best_score = None
+    tied = 0
+
+    for _ in range(candidates):
+        mixed = _random_row_mix(H, rng)
+        weights = mixed.sum(axis=1, dtype=np.int64)
+        clipped = np.clip(weights, lower, upper)
+        distance = weights - clipped
+        score = int(distance @ distance)
+
+        if best_score is None or score < best_score:
+            best = mixed
+            best_score = score
+            tied = 1
+        elif score == best_score:
+            tied += 1
+            if rng.integers(tied) == 0:
+                best = mixed
+
+    return best
+
+
+def random_bch2_parity_check(variable_count, rng=None, row_mix_candidates=64):
+    """
+    Construct a randomized, shortened binary two-error-correcting BCH matrix.
 
     Parameters
     ----------
-    r : int
-        Field degree. The matrix has:
-            n = 2**r - 1 columns
-            2*r rows
+    variable_count : int
+        Number of columns in the matrix. The field degree is the smallest r
+        for which variable_count <= 2**r - 1 (and at least 3). The matrix has
+        2*r rows.
 
         Practical puzzle sizes include:
-            r=3:  7 variables,  6 checks
-            r=4: 15 variables,  8 checks
-            r=5: 31 variables, 10 checks
+            2--7 variables:   6 checks
+            8--15 variables:  8 checks
+            16--31 variables: 10 checks
 
     rng : None, int, or numpy.random.Generator
         Random-number source.
 
+    row_mix_candidates : int
+        Number of random invertible row mixes from which to select the most
+        balanced one. Must be at least 1.
+
     Returns
     -------
-    H : ndarray of shape (2*r, 2**r - 1), dtype uint8
+    H : ndarray of shape (2*r, variable_count), dtype uint8
         A binary parity-check matrix capable of uniquely locating any
         pair of erroneous coordinates.
     """
-    if isinstance(r, bool) or not isinstance(r, (int, np.integer)):
-        raise TypeError("r must be an integer")
-    if not 3 <= r <= 16:
-        raise ValueError("r must be between 3 and 16")
+    if isinstance(variable_count, bool) or not isinstance(
+        variable_count, (int, np.integer)
+    ):
+        raise TypeError("variable_count must be an integer")
+    if not 2 <= variable_count <= (1 << 16) - 1:
+        raise ValueError("variable_count must be between 2 and 65535")
+
+    r = max(3, int(variable_count).bit_length())
 
     rng = np.random.default_rng(rng)
 
@@ -311,11 +361,13 @@ def random_bch2_parity_check(r, rng=None):
         for bit in range(r):
             H[r + bit, i] = (x_cubed >> bit) & 1
 
-    # Randomize the coordinate-to-variable correspondence.
-    H = H[:, rng.permutation(n)]
+    # Randomly choose the retained coordinates. Deleting columns this way
+    # shortens the code; distinct two-error syndromes remain distinct.
+    H = H[:, rng.permutation(n)[:variable_count]]
 
-    # Randomize the parity equations themselves.
-    H = _random_row_mix(H, rng)
+    # Randomize the parity equations themselves, preferring mixes without
+    # very short or unusually long equations.
+    H = _balanced_random_row_mix(H, rng, row_mix_candidates)
 
     return H
 
@@ -449,7 +501,9 @@ def run_test(llm, args):
 
     rng = np.random.default_rng()
 
-    H = random_bch2_parity_check(args.bch, rng)
+    H = random_bch2_parity_check(
+        args.variables, rng, row_mix_candidates=args.row_mix_candidates
+    )
     corig, cerr, rhs, error_indices = make_two_error_puzzle(H, rng)
     logic = bch_to_logic(H, cerr, rhs, number_wrong=2, some=args.some)
 
@@ -509,6 +563,7 @@ def run_test(llm, args):
 
     try:
         correct = False
+        alternative = False
         tmp = content.strip().removeprefix("(").removesuffix(")")
         parts = tmp.split(",")
         if len(parts) == len(corig):
@@ -558,10 +613,11 @@ def main():
         description="Generate a long Python calculation exercise."
     )
     parser.add_argument(
-        "--bch",
+        "-v",
+        "--variables",
         type=int,
-        default=3,
-        help="BCH `r` parameter",
+        default=4,
+        help="number of variables, between 2 and 21",
     )
     parser.add_argument(
         "-r",
@@ -569,6 +625,12 @@ def main():
         type=int,
         default=50,
         help="number of times the test is repeated",
+    )
+    parser.add_argument(
+        "--row-mix-candidates",
+        type=int,
+        default=64,
+        help="number of randomized parity-check mixes to score (default: 64)",
     )
     parser.add_argument(
         "-p",
