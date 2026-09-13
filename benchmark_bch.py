@@ -411,7 +411,7 @@ def make_two_error_puzzle(H, rng=None):
     return correct, displayed, rhs, error_indices
 
 
-def bch_to_logic(H, displayed, rhs, number_wrong=2, some=False):
+def bch_to_logic(H, correct, displayed, rhs, number_wrong=2, phrasing='exactly'):
     H = np.asarray(H, dtype=np.uint8)
     displayed = np.asarray(displayed, dtype=np.uint8)
     rhs = np.asarray(rhs, dtype=np.uint8)
@@ -421,6 +421,8 @@ def bch_to_logic(H, displayed, rhs, number_wrong=2, some=False):
 
     m, n = H.shape
 
+    if correct.shape != (n,):
+        raise ValueError("correct must have one value per column of H")
     if displayed.shape != (n,):
         raise ValueError("displayed must have one value per column of H")
     if rhs.shape != (m,):
@@ -434,7 +436,7 @@ def bch_to_logic(H, displayed, rhs, number_wrong=2, some=False):
     names = [variable_name(i) for i in range(n)]
 
     assignments = ", ".join(
-        f"{name} = {bool(value)}" for name, value in zip(names, displayed)
+        f"{name} = {bool(value)}" for name, value in zip(names, (correct if phrasing == "alternative" else displayed))
     )
 
     checks = []
@@ -444,17 +446,33 @@ def bch_to_logic(H, displayed, rhs, number_wrong=2, some=False):
         checks.append(f"{expression} = {bool(expected)}")
 
     word = "expression" if number_wrong == 1 else "expressions"
+    if phrasing == 'exactly':
+        phrase = f"Exactly {number_wrong} of these {word} are incorrect:\n"
+    elif phrasing == 'some':
+        phrase = "Some of these expressions are incorrect:\n"
+    elif phrasing == 'ignore':
+        phrase = "These expressions may be incorrect and should be ignored:\n"
+    elif phrasing == "boolean":
+        phrase = "All variables are boolean.\n"
+    elif phrasing == "alternative":
+        phrase = "This is a valid solution:\n"
+    else:
+        raise ValueError("invalid phrasing")
 
-    return (
-        (
-            f"Some of these expressions are incorrect:\n"
-            if some
-            else f"Exactly {number_wrong} of these {word} are incorrect:\n"
+    problem = "The following expressions are all correct:\n" + "\n".join(checks)
+
+    if phrasing == "alternative":
+        return (
+            problem + "\n\n" +
+            phrase + f"{assignments}\n\n" +
+            f"What is the alternative solution ({', '.join(names)})?"
         )
-        + f"{assignments}\n\n"
-        "The following expressions are all correct:\n" + "\n".join(checks) + "\n\n"
-        f"What is the value of ({', '.join(names)})?"
-    )
+    else:
+        return (
+            phrase + (f"{assignments}\n\n" if phrasing != "boolean" else "\n") +
+            problem + "\n\n"
+            f"What is the value of ({', '.join(names)})?"
+        )
 
 
 def brute_force_two_error_solutions(H, displayed, rhs):
@@ -497,15 +515,15 @@ def brute_force_two_error_solutions(H, displayed, rhs):
     return solutions
 
 
-def run_test(llm, args):
+def run_test(llm, args, variables):
 
     rng = np.random.default_rng()
 
     H = random_bch2_parity_check(
-        args.variables, rng, row_mix_candidates=args.row_mix_candidates
+        variables, rng, row_mix_candidates=args.row_mix_candidates
     )
     corig, cerr, rhs, error_indices = make_two_error_puzzle(H, rng)
-    logic = bch_to_logic(H, cerr, rhs, number_wrong=2, some=args.some)
+    logic = bch_to_logic(H, corig, cerr, rhs, number_wrong=2, phrasing=args.phrasing)
 
     solutions = brute_force_two_error_solutions(H, cerr, rhs)
     assert len(solutions) == 1
@@ -584,26 +602,36 @@ def run_test(llm, args):
     print(("CORRECT" if correct else "ALTERNATIVE" if alternative else "WRONG") if valid else "INVALID")
     print()
 
-    return (correct, valid)
+    return (correct, valid, alternative)
 
 
-def run_sample(llm, args):
+def run_sample(llm, args, variables):
 
     test = BernoulliSPRT(max_trials=args.repeats)
 
     score = 0
+    score_alt = 0
     invalid = 0
     total = 0
     for rep in range(args.repeats):
-        (correct, valid) = run_test(llm=llm, args=args)
+        (correct, valid, alternative) = run_test(llm=llm, args=args, variables=variables)
         score += int(correct and valid)
+        score_alt += int(alternative and not correct and valid)
         invalid += int(not valid)
         total += 1
+        if args.horizon:
+            status = test.step(correct and valid)
+            if status != "CONTINUE":
+                print(test.status)
+                break
 
-    print(f"Provider:      {args.provider}")
-    print(f"Model:         {args.model}")
-    print(f"Total score:   {score} / {total}  ({100 * score // total}%)")
-    print(f"Total invalid: {invalid} / {total}  ({100 * invalid // total}%)")
+    print(f"Provider:          {args.provider}")
+    print(f"Model:             {args.model}")
+    print(f"Variables:         {variables}")
+    print(f"Input dots:        {args.input_dots}")
+    print(f"Total correct:     {score} / {total}  ({100 * score // total}%)")
+    print(f"Total alternative: {score_alt} / {total}  ({100 * score_alt // total}%)")
+    print(f"Total invalid:     {invalid} / {total}  ({100 * invalid // total}%)")
 
     return (score, invalid, total)
 
@@ -647,9 +675,16 @@ def main():
         help="model name (via LangChain)",
     )
     parser.add_argument(
-        "--some",
-        action="store_true",
+        "--phrasing",
+        type=str,
+        default="exactly",
+        choices=["exactly", "some", "ignore", "boolean", "alternative"],
         help="change question phrasing to 'some of these are incorrect'",
+    )
+    parser.add_argument(
+        "--horizon",
+        action="store_true",
+        help="calculate success horizon using binary search over variables",
     )
     parser.add_argument(
         "--dry-run",
@@ -694,7 +729,35 @@ def main():
             **kwargs,
         )
 
-    run_sample(llm=llm, args=args)
+    if args.horizon:
+        # One variable cannot contain the two errors required by the puzzle,
+        # so begin at the smallest supported variable count.
+        lo = 1
+        hi = 2
+        while True:
+            (score, invalid, total) = run_sample(
+                llm=llm, args=args, variables=hi
+            )
+            if score * 2 < total:
+                break
+            if hi >= 256:
+                lo = hi
+                break
+            lo = hi
+            hi *= 2
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            (score, invalid, total) = run_sample(
+                llm=llm, args=args, variables=mid
+            )
+            if score * 2 < total:
+                hi = mid
+            else:
+                lo = mid
+        print()
+        print(f"Success horizon: {lo} variables")
+    else:
+        run_sample(llm=llm, args=args, variables=args.variables)
 
 
 if __name__ == "__main__":
