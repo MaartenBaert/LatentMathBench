@@ -57,7 +57,7 @@ def _plot_data(payload):
         columns.append(values)
         labels.append(f"LLM ({trace['total_dots']} dots)")
     columns.append(exact)
-    labels.append("Exact")
+    labels.append("Exact marginal")
     columns.append(map_assignment)
     labels.append("MAP")
     return np.column_stack(columns), labels

@@ -23,8 +23,6 @@ TEST_CASES = {
         / "rawdump-bch-soft-v3"
         / "astra-v11-r100-300dots-lora5.pkl",
         "puzzle_index": 71,
-        "prompt_alignment_dots": 100,
-        "expected_initial_input_tokens": 384,
     },
     "3000dots-six-flips": {
         "kind": "text",
@@ -32,8 +30,6 @@ TEST_CASES = {
         "puzzle_block_index": 39,
         "line_number": 1405,
         "input_dots": 3000,
-        "prompt_alignment_dots": 74,
-        "expected_initial_input_tokens": 384,
     },
     "1000dots-three-flips": {
         "kind": "text",
@@ -41,8 +37,6 @@ TEST_CASES = {
         "puzzle_block_index": 7,
         "line_number": 267,
         "input_dots": 1000,
-        "prompt_alignment_dots": 40,
-        "expected_initial_input_tokens": 384,
     },
     "300dots-two-flips": {
         "kind": "text",
@@ -50,15 +44,45 @@ TEST_CASES = {
         "puzzle_block_index": 116,
         "line_number": 4059,
         "input_dots": 300,
-        "prompt_alignment_dots": 76,
-        "expected_initial_input_tokens": 384,
+    },
+    "random-correct-7-vars": {
+        "kind": "text",
+        "path": WORKSPACE_ROOT / "rawdump-bch-soft-v2" / "astra-horizon-100dots.txt",
+        "puzzle_block_index": 105,
+        "line_number": 3362,
+        "input_dots": 100,
+    },
+    "random-correct-8-vars": {
+        "kind": "text",
+        "path": WORKSPACE_ROOT / "rawdump-bch-soft-v2" / "astra-horizon-100dots.txt",
+        "puzzle_block_index": 61,
+        "line_number": 1983,
+        "input_dots": 100,
+    },
+    "random-correct-9-vars": {
+        "kind": "text",
+        "path": WORKSPACE_ROOT / "rawdump-bch-soft-v2" / "astra-horizon-1000dots.txt",
+        "puzzle_block_index": 89,
+        "line_number": 3228,
+        "input_dots": 1000,
+    },
+    "random-correct-10-vars": {
+        "kind": "text",
+        "path": WORKSPACE_ROOT / "rawdump-bch-soft-v2" / "astra-horizon-1000dots.txt",
+        "puzzle_block_index": 31,
+        "line_number": 1155,
+        "input_dots": 1000,
+    },
+    "random-correct-11-vars": {
+        "kind": "text",
+        "path": WORKSPACE_ROOT / "rawdump-bch-soft-v2" / "astra-horizon-3000dots.txt",
+        "puzzle_block_index": 88,
+        "line_number": 3217,
+        "input_dots": 3000,
     },
 }
 TEXT_PUZZLE_MARKER = "Answer immediately with one tuple and nothing else.\n\n"
-CACHE_MINIMUM_TOKENS = 1024
-CACHE_REPORTING_GRANULARITY = 128
-EXPECTED_MESSAGE_FRAMING_TOKENS = 4
-EXPECTED_INPUT_TOKEN_INCREMENT = 128
+DOT_STEP = 100
 DEFAULT_OUTPUT = "trace-bch-soft-marginal.pkl"
 
 MARGINAL_SYSTEM_PROMPT = (
@@ -272,9 +296,9 @@ def _system_prompt(phrasing):
     return ORIGINAL_SYSTEM_PROMPT
 
 
-def _dot_message(dot_count):
-    """Return N dots that tokenize to N tokens in o200k_base/cl100k_base."""
-    return " ".join("." for _ in range(dot_count))
+def _prompt_with_dots(prompt, dot_count):
+    """Match benchmark_bch_soft.py's dot padding exactly."""
+    return prompt + "\n" + ". " * dot_count
 
 
 def _response_text(response):
@@ -338,44 +362,6 @@ def _parse_reported_marginals(content, variable_count, phrasing):
     return np.where(solution, confidences, 1.0 - confidences)
 
 
-def _usage_detail(input_details, name):
-    direct = input_details.get(name)
-    if direct is not None:
-        return int(direct)
-    tier_values = [
-        int(value)
-        for key, value in input_details.items()
-        if key.endswith(f"_{name}") and value is not None
-    ]
-    return sum(tier_values)
-
-
-def _cache_validation(previous_input_tokens, cache_read_tokens):
-    """Return cache validation metadata, raising for an eligible cache miss."""
-    if previous_input_tokens < CACHE_MINIMUM_TOKENS:
-        return {
-            "status": "previous_prompt_below_cache_minimum",
-            "required_cached_tokens": 0,
-            "valid": None,
-        }
-    required = (
-        previous_input_tokens // CACHE_REPORTING_GRANULARITY
-    ) * CACHE_REPORTING_GRANULARITY
-    valid = cache_read_tokens >= required
-    result = {
-        "status": "passed" if valid else "failed",
-        "required_cached_tokens": required,
-        "valid": valid,
-    }
-    if not valid:
-        raise RuntimeError(
-            "prompt-cache validation failed: the previous request used "
-            f"{previous_input_tokens} input tokens, so at least {required} cached "
-            f"tokens were required, but the API reported {cache_read_tokens}"
-        )
-    return result
-
-
 def _save_trace(filename, payload):
     path = Path(filename)
     with open(path, "wb") as output_file:
@@ -387,7 +373,16 @@ def _model_kwargs(model):
         return {}
     if model in ("gpt-5", "gpt-5-mini", "gpt-5-nano"):
         return {"reasoning_effort": "minimal"}
-    if model.startswith(("gpt-6", "claude-")):
+    if model in (
+        "gpt-6-astra",
+        "claude-opus-4-5",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-opus-5",
+    ):
         return {"reasoning_effort": "low"}
     return {"reasoning_effort": "none"}
 
@@ -413,20 +408,8 @@ def main():
     parser.add_argument(
         "--max-dots",
         type=int,
-        default=2048,
-        help="largest experimental dot count to test (default: 2048)",
-    )
-    parser.add_argument(
-        "--dot-step",
-        type=int,
-        default=124,
-        help="dot tokens per new message; 124 plus framing targets 128 (default: 124)",
-    )
-    parser.add_argument(
-        "--prompt-alignment-dots",
-        type=int,
-        default=None,
-        help="dots padding the fixed prompt (default: calibrated per test case)",
+        default=2000,
+        help="largest dot count to test in increments of 100 (default: 2000)",
     )
     parser.add_argument(
         "-o",
@@ -434,29 +417,12 @@ def main():
         default=DEFAULT_OUTPUT,
         help=f"pickle output file (default: {DEFAULT_OUTPUT})",
     )
-    parser.add_argument(
-        "--prompt-cache-key",
-        default=None,
-        help="stable prompt-cache routing/accounting key (default: prompt-specific)",
-    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if args.max_dots < 0:
-        parser.error("--max-dots must be non-negative")
-    if args.dot_step < 1:
-        parser.error("--dot-step must be positive")
-    if args.prompt_alignment_dots is not None and args.prompt_alignment_dots < 0:
-        parser.error("--prompt-alignment-dots must be non-negative")
-
-    test_case = TEST_CASES[args.test_case]
-    if args.prompt_alignment_dots is None:
-        args.prompt_alignment_dots = test_case["prompt_alignment_dots"]
-    if args.prompt_cache_key is None:
-        args.prompt_cache_key = f"trace-bch-soft-marginal-{args.test_case}-v1"
-        if args.phrasing != "marginal":
-            args.prompt_cache_key = (
-                f"trace-bch-soft-marginal-{args.test_case}-{args.phrasing}-v1"
-            )
+    if args.max_dots < DOT_STEP:
+        parser.error(f"--max-dots must be at least {DOT_STEP}")
+    if args.max_dots % DOT_STEP:
+        parser.error(f"--max-dots must be a multiple of {DOT_STEP}")
 
     problem, source = _load_selected_puzzle(args.test_case)
     exact_marginals = _exact_marginals(problem)
@@ -470,16 +436,8 @@ def main():
         (prior_probabilities - 0.5) * (exact_marginals - 0.5) < 0.0
     )
     unpadded_prompt = _problem_prompt(problem, args.phrasing)
-    prompt = unpadded_prompt
-    if args.prompt_alignment_dots:
-        prompt += "\n\n" + _dot_message(args.prompt_alignment_dots)
     system_prompt = _system_prompt(args.phrasing)
-    messages = [SystemMessage(system_prompt), HumanMessage(prompt)]
-    expected_initial_input_tokens = (
-        test_case["expected_initial_input_tokens"]
-        if args.phrasing == "marginal"
-        else None
-    )
+    first_prompt = _prompt_with_dots(unpadded_prompt, DOT_STEP)
 
     payload = {
         "format": "trace_bch_soft_marginal",
@@ -492,18 +450,8 @@ def main():
             "reasoning_effort": _model_kwargs(args.model).get("reasoning_effort"),
             "max_output_tokens": 200,
             "max_dots": args.max_dots,
-            "dot_step": args.dot_step,
-            "prompt_alignment_dots": args.prompt_alignment_dots,
-            "prompt_cache_key": args.prompt_cache_key,
-            "prompt_cache_options": {"mode": "implicit"},
-            "cache_minimum_tokens": CACHE_MINIMUM_TOKENS,
-            "cache_reporting_granularity": CACHE_REPORTING_GRANULARITY,
-            "expected_initial_input_tokens_with_default_padding": (
-                expected_initial_input_tokens
-            ),
-            "expected_message_framing_tokens": EXPECTED_MESSAGE_FRAMING_TOKENS,
-            "expected_input_token_increment": EXPECTED_INPUT_TOKEN_INCREMENT,
-            "tokenizer_encodings_checked": ["o200k_base", "cl100k_base"],
+            "dot_step": DOT_STEP,
+            "explicit_prompt_caching": False,
             "dry_run": args.dry_run,
         },
         "puzzle": {
@@ -524,7 +472,7 @@ def main():
             "logic": problem["logic"],
             "system_prompt": system_prompt,
             "unpadded_trace_prompt": unpadded_prompt,
-            "trace_prompt": prompt,
+            "trace_prompt": first_prompt,
         },
         "traces": [],
     }
@@ -540,13 +488,7 @@ def main():
         )
     print(f"Prior-to-marginal flips: {flip_indices.tolist()}")
     print(f"Exact marginals: {tuple(float(value) for value in exact_marginals)}")
-    print(f"Initial prompt padding: {args.prompt_alignment_dots} dots")
-    if expected_initial_input_tokens is not None:
-        print(f"Expected initial total input: {expected_initial_input_tokens} tokens")
-    print(
-        f"Each subsequent dot message: {args.dot_step} dot tokens + approximately "
-        f"{EXPECTED_MESSAGE_FRAMING_TOKENS} framing tokens"
-    )
+    print(f"Dot counts: {DOT_STEP}, {2 * DOT_STEP}, ... {args.max_dots}")
     print(f"Reasoning effort: {_model_kwargs(args.model).get('reasoning_effort')}")
     print(f"Output: {args.output}")
     print()
@@ -557,16 +499,14 @@ def main():
             model_provider=args.provider,
             model=args.model,
             max_tokens=200,
-            prompt_cache_options={"mode": "implicit"},
             **_model_kwargs(args.model),
         )
 
-    previous_input_tokens = None
     for request_index, total_dots in enumerate(
-        range(0, args.max_dots + 1, args.dot_step)
+        range(DOT_STEP, args.max_dots + 1, DOT_STEP)
     ):
-        if request_index:
-            messages.append(HumanMessage(_dot_message(args.dot_step)))
+        prompt = _prompt_with_dots(unpadded_prompt, total_dots)
+        messages = [SystemMessage(system_prompt), HumanMessage(prompt)]
 
         started = time.monotonic()
         if args.dry_run:
@@ -578,12 +518,15 @@ def main():
             valid_no_reasoning = None
             reported_marginals = None
             parse_error = "dry run"
-            cache_validation = {"status": "not_checked", "valid": None}
         else:
-            response = llm.invoke(
-                messages,
-                prompt_cache_key=args.prompt_cache_key,
-            )
+            while True:
+                try:
+                    response = llm.invoke(messages)
+                    break
+                except Exception as error:  # noqa: BLE001 - match benchmark retry loop
+                    print(error)
+                    print("Retrying in 10 seconds ...")
+                    time.sleep(10)
             print("Full model response:")
             print(response)
             print()
@@ -591,28 +534,9 @@ def main():
             content = _response_text(response)
             response_metadata = dict(response.response_metadata)
             usage_metadata = dict(response.usage_metadata or {})
-            input_details = usage_metadata.get("input_token_details", {})
             output_details = usage_metadata.get("output_token_details", {})
-            cache_read_tokens = _usage_detail(input_details, "cache_read")
             reasoning_tokens = int(output_details.get("reasoning", 0) or 0)
             valid_no_reasoning = reasoning_tokens == 0
-            if previous_input_tokens is None:
-                cache_validation = {"status": "initial_request", "valid": None}
-            else:
-                try:
-                    cache_validation = _cache_validation(
-                        previous_input_tokens, cache_read_tokens
-                    )
-                except RuntimeError as error:
-                    cache_validation = {
-                        "status": "failed",
-                        "required_cached_tokens": (
-                            previous_input_tokens // CACHE_REPORTING_GRANULARITY
-                        )
-                        * CACHE_REPORTING_GRANULARITY,
-                        "valid": False,
-                        "error": str(error),
-                    }
             try:
                 reported_marginals = _parse_reported_marginals(
                     content, problem["variables"], args.phrasing
@@ -624,15 +548,10 @@ def main():
 
         elapsed_seconds = time.monotonic() - started
         input_tokens = usage_metadata.get("input_tokens")
-        input_details = usage_metadata.get("input_token_details", {})
-        cache_read_tokens = _usage_detail(input_details, "cache_read")
         record = {
             "request_index": request_index,
             "total_dots": total_dots,
-            "total_dots_including_prompt_alignment": (
-                total_dots + args.prompt_alignment_dots
-            ),
-            "dot_message_count": request_index,
+            "prompt": prompt,
             "response_repr": response_repr,
             "raw_response": content,
             "reported_marginals": reported_marginals,
@@ -641,12 +560,6 @@ def main():
             "usage_metadata": usage_metadata,
             "reasoning_tokens": reasoning_tokens,
             "valid_no_reasoning": valid_no_reasoning,
-            "input_token_alignment_valid": (
-                input_tokens % CACHE_REPORTING_GRANULARITY == 0
-                if input_tokens is not None
-                else None
-            ),
-            "cache_validation": cache_validation,
             "elapsed_seconds": elapsed_seconds,
         }
         payload["traces"].append(record)
@@ -654,28 +567,14 @@ def main():
 
         print(
             f"dots={total_dots}: input_tokens={input_tokens}, "
-            f"cached_tokens={cache_read_tokens}, "
-            f"cache={cache_validation['status']}, "
             f"reasoning_tokens={reasoning_tokens}"
         )
-        if input_tokens is not None and input_tokens % CACHE_REPORTING_GRANULARITY:
-            padding_adjustment = (-input_tokens) % CACHE_REPORTING_GRANULARITY
-            print(
-                f"WARNING: input token count is not 128-aligned; add "
-                f"{padding_adjustment} to --prompt-alignment-dots on the next run"
-            )
         print(f"response={content}")
         if parse_error is not None:
             print(f"parse_error={parse_error}")
         if valid_no_reasoning is False:
             print("INVALID: response used reasoning tokens")
         print()
-
-        if cache_validation.get("valid") is False:
-            print(f"WARNING: {cache_validation['error']}")
-            print()
-        if input_tokens is not None:
-            previous_input_tokens = int(input_tokens)
 
 
 if __name__ == "__main__":
