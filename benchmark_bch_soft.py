@@ -1,13 +1,12 @@
 import argparse
 import itertools
 import math
+import pickle
 import time
 
 import numpy as np
-
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
-
 
 SYSTEM_PROMPT = "Do not reason, deliberate, or work anything out. Emit the final answer on your very first token. No explanation, no steps, no scratch work."
 
@@ -47,9 +46,7 @@ class BernoulliSPRT:
         outcome = int(outcome)
         self.trials += 1
         self.successes += outcome
-        self.log_likelihood_ratio += (
-            self.llr_success if outcome else self.llr_failure
-        )
+        self.log_likelihood_ratio += self.llr_success if outcome else self.llr_failure
 
         if self.log_likelihood_ratio >= self.upper_log_bound:
             self.status = "HIGH: evidence for p >= p_high"
@@ -223,9 +220,7 @@ def random_bch_parity_check(
             value ^= primitive_poly
         powers[index] = value & code_length
 
-    matrix = np.empty(
-        (correctable_errors * degree, code_length), dtype=np.uint8
-    )
+    matrix = np.empty((correctable_errors * degree, code_length), dtype=np.uint8)
     for index in range(code_length):
         for syndrome_index in range(correctable_errors):
             exponent = 2 * syndrome_index + 1
@@ -306,16 +301,35 @@ def solution_log_probability(solution, percentages):
     )
 
 
-def choose_probabilities(solutions, rng, threshold, max_attempts):
-    """Sample priors until the most likely valid solution is separated enough."""
-    if threshold < 1:
-        raise ValueError("threshold must be at least 1")
+def choose_probabilities(
+    solutions,
+    rng,
+    ratio_min,
+    ratio_max,
+    max_attempts,
+    marginal_min=0.0,
+    marginal_max=1.0,
+):
+    """Sample priors until the ratio and marginal/MAP difference are in range."""
+    if math.isnan(ratio_min) or ratio_min < 1:
+        raise ValueError("ratio_min must be at least 1")
+    if math.isnan(ratio_max) or ratio_max < ratio_min:
+        raise ValueError("ratio_max must be at least ratio_min")
+    if not 0.0 <= marginal_min <= 1.0:
+        raise ValueError("marginal_min must be between 0 and 1")
+    if not marginal_min <= marginal_max <= 1.0:
+        raise ValueError("marginal_max must be between marginal_min and 1")
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
 
     solution_array = np.asarray(solutions, dtype=np.uint8)
     if len(solution_array) == 0:
         raise ValueError("at least one valid solution is required")
+
+    inclusive_ratio_min = np.nextafter(ratio_min, -math.inf)
+    inclusive_ratio_max = np.nextafter(ratio_max, math.inf)
+    inclusive_marginal_min = np.nextafter(marginal_min, -math.inf)
+    inclusive_marginal_max = np.nextafter(marginal_max, math.inf)
 
     for _ in range(max_attempts):
         percentages = rng.integers(10, 91, size=solution_array.shape[1])
@@ -324,19 +338,39 @@ def choose_probabilities(solutions, rng, threshold, max_attempts):
         log_odds = np.log(probabilities) - log_false
         log_scores = solution_array @ log_odds + log_false.sum()
         if len(log_scores) == 1:
-            best_index = 0
-            return percentages, solution_array[best_index], math.inf
-        top_two = np.argpartition(log_scores, -2)[-2:]
-        if log_scores[top_two[0]] > log_scores[top_two[1]]:
-            best_index, second_index = map(int, top_two)
+            best_index, probability_ratio = 0, math.inf
         else:
-            second_index, best_index = map(int, top_two)
-        log_ratio = float(log_scores[best_index] - log_scores[second_index])
-        if log_ratio > math.log(threshold):
-            return percentages, solution_array[best_index], math.exp(log_ratio)
+            top_two = np.argpartition(log_scores, -2)[-2:]
+            if log_scores[top_two[0]] > log_scores[top_two[1]]:
+                best_index, second_index = map(int, top_two)
+            else:
+                second_index, best_index = map(int, top_two)
+            log_ratio = float(log_scores[best_index] - log_scores[second_index])
+            probability_ratio = math.exp(log_ratio)
+        if not inclusive_ratio_min <= probability_ratio <= inclusive_ratio_max:
+            continue
+
+        weights = np.exp(log_scores - log_scores.max())
+        exact_marginals = (weights @ solution_array) / weights.sum()
+        maximum_marginal_map_difference = np.abs(
+            exact_marginals - solution_array[best_index]
+        ).max()
+        if (
+            inclusive_marginal_min
+            <= maximum_marginal_map_difference
+            <= inclusive_marginal_max
+        ):
+            return (
+                percentages,
+                solution_array[best_index],
+                probability_ratio,
+                float(maximum_marginal_map_difference),
+            )
 
     raise RuntimeError(
-        f"could not find probabilities exceeding threshold {threshold} "
+        f"could not find probabilities with a best/second ratio in the inclusive "
+        f"range [{ratio_min}, {ratio_max}] and a maximum absolute marginal/MAP "
+        f"difference in the inclusive range [{marginal_min}, {marginal_max}] "
         f"in {max_attempts} attempts"
     )
 
@@ -382,8 +416,19 @@ def run_test(llm, args, variables):
     seed_solution = rng.integers(0, 2, size=variables, dtype=np.uint8)
     rhs = _gf2_matvec(matrix, seed_solution)
     solutions = all_parity_solutions(matrix, rhs)
-    percentages, answer, probability_ratio = choose_probabilities(
-        solutions, rng, args.threshold, args.max_probability_attempts
+    (
+        percentages,
+        answer,
+        probability_ratio,
+        maximum_marginal_map_difference,
+    ) = choose_probabilities(
+        solutions,
+        rng,
+        args.ratio_min,
+        args.ratio_max,
+        args.max_probability_attempts,
+        args.marginal_min,
+        args.marginal_max,
     )
     logic = bch_to_soft_logic(matrix, percentages, rhs)
 
@@ -440,10 +485,34 @@ def run_test(llm, args, variables):
     print(f"Model answer: {content}")
     print(f"Correct answer: {tuple(bool(value) for value in answer)}")
     print(f"Best/second probability ratio: {probability_ratio:.6g}")
+    print(
+        "Maximum absolute marginal/MAP difference: "
+        f"{maximum_marginal_map_difference:.6g}"
+    )
     print(f"Reasoning tokens: {reasoning_tokens}")
     result = "CORRECT" if correct else "ALTERNATIVE" if alternative else "WRONG"
     print(result if valid else "INVALID")
     print()
+
+    if getattr(args, "dump", None) is not None:
+        args.dump_records.append(
+            {
+                "variables": variables,
+                "matrix": matrix.copy(),
+                "rhs": rhs.copy(),
+                "percentages": percentages.copy(),
+                "correct_answer": answer.copy(),
+                "probability_ratio": probability_ratio,
+                "maximum_marginal_map_difference": maximum_marginal_map_difference,
+                "logic": logic,
+                "prompt": prompt,
+                "model_answer": content,
+                "reasoning_tokens": reasoning_tokens,
+                "correct": bool(correct),
+                "valid": bool(valid),
+                "alternative": bool(alternative),
+            }
+        )
     return correct, valid, alternative
 
 
@@ -467,7 +536,8 @@ def run_sample(llm, args, variables):
     print(f"Model:             {args.model}")
     print(f"Variables:         {variables}")
     print(f"Correctable errors: {args.correctable_errors}")
-    print(f"Threshold:         {args.threshold}")
+    print(f"Ratio range:       [{args.ratio_min}, {args.ratio_max}]")
+    print(f"Marginal range:    [{args.marginal_min}, {args.marginal_max}]")
     print(f"Input dots:        {args.input_dots}")
     print(f"Total correct:     {score} / {total}  ({100 * score // total}%)")
     print(f"Total alternative: {score_alt} / {total}  ({100 * score_alt // total}%)")
@@ -481,7 +551,10 @@ def main():
     )
     parser.add_argument("-v", "--variables", type=int, default=10)
     parser.add_argument("-r", "--repeats", type=int, default=50)
-    parser.add_argument("--threshold", type=float, default=4.0)
+    parser.add_argument("--ratio-min", type=float, default=4.0)
+    parser.add_argument("--ratio-max", type=float, default=np.inf)
+    parser.add_argument("--marginal-min", type=float, default=0.0)
+    parser.add_argument("--marginal-max", type=float, default=1.0)
     parser.add_argument("--max-probability-attempts", type=int, default=10000)
     parser.add_argument(
         "--correctable-errors",
@@ -495,14 +568,26 @@ def main():
     parser.add_argument("--horizon", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--input-dots", type=int, default=None)
+    parser.add_argument(
+        "--dump",
+        metavar="FILE",
+        help="pickle every generated puzzle and its model outcome to FILE",
+    )
     parser.add_argument("--lo", type=int, default=None)
     parser.add_argument("--hi", type=int, default=None)
     args = parser.parse_args()
+    args.dump_records = []
 
     if not 2 <= args.variables <= 21:
         parser.error("--variables must be between 2 and 21")
-    if args.threshold < 1:
-        parser.error("--threshold must be at least 1")
+    if math.isnan(args.ratio_min) or args.ratio_min < 1:
+        parser.error("--ratio-min must be at least 1")
+    if math.isnan(args.ratio_max) or args.ratio_max < args.ratio_min:
+        parser.error("--ratio-max must be at least --ratio-min")
+    if not 0.0 <= args.marginal_min <= 1.0:
+        parser.error("--marginal-min must be between 0 and 1")
+    if not args.marginal_min <= args.marginal_max <= 1.0:
+        parser.error("--marginal-max must be between --marginal-min and 1")
     if args.max_probability_attempts < 1:
         parser.error("--max-probability-attempts must be at least 1")
     if args.correctable_errors < 1:
@@ -527,11 +612,15 @@ def main():
     else:
         kwargs["reasoning_effort"] = "none"
 
-    llm = None if args.dry_run else init_chat_model(
-        model_provider=args.provider,
-        model=args.model,
-        max_tokens=100,
-        **kwargs,
+    llm = (
+        None
+        if args.dry_run
+        else init_chat_model(
+            model_provider=args.provider,
+            model=args.model,
+            max_tokens=100,
+            **kwargs,
+        )
     )
 
     if args.horizon:
@@ -558,6 +647,28 @@ def main():
         print(f"Success horizon: {lo} variables")
     else:
         run_sample(llm, args, args.variables)
+
+    if args.dump is not None:
+        payload = {
+            "format": "benchmark_bch_soft",
+            "version": 1,
+            "benchmark": {
+                "provider": args.provider,
+                "model": args.model,
+                "ratio_min": args.ratio_min,
+                "ratio_max": args.ratio_max,
+                "marginal_min": args.marginal_min,
+                "marginal_max": args.marginal_max,
+                "correctable_errors": args.correctable_errors,
+                "row_mix_candidates": args.row_mix_candidates,
+                "input_dots": args.input_dots,
+                "dry_run": args.dry_run,
+            },
+            "problems": args.dump_records,
+        }
+        with open(args.dump, "wb") as dump_file:
+            pickle.dump(payload, dump_file, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Dumped {len(args.dump_records)} problems to {args.dump}")
 
 
 if __name__ == "__main__":
