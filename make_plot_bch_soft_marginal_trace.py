@@ -28,6 +28,23 @@ def _load_trace(filename):
     return payload
 
 
+def _nearest_alternative(puzzle, reference):
+    matrix = np.asarray(puzzle["matrix"], dtype=np.uint8)
+    rhs = np.asarray(puzzle["rhs"], dtype=np.uint8)
+    standard = np.asarray(puzzle["correct_answer"], dtype=np.uint8)
+    variable_count = matrix.shape[1]
+    assignments = np.arange(1 << variable_count, dtype=np.uint64)[:, None]
+    bits = ((assignments >> np.arange(variable_count, dtype=np.uint64)) & 1).astype(
+        np.uint8
+    )
+    valid = bits[np.all((bits @ matrix.T) % 2 == rhs, axis=1)]
+    alternatives = valid[np.any(valid != standard, axis=1)]
+    if len(alternatives) == 0:
+        return np.full(variable_count, 0.5, dtype=np.float64)
+    squared_distances = np.sum(np.square(alternatives - reference), axis=1)
+    return alternatives[np.argmin(squared_distances)].astype(np.float64)
+
+
 def _plot_data(payload):
     puzzle = payload["puzzle"]
     variable_count = int(puzzle["variables"])
@@ -59,18 +76,26 @@ def _plot_data(payload):
     columns.append(exact)
     labels.append("Exact marginal")
     columns.append(map_assignment)
-    labels.append("MAP")
+    labels.append("Standard solution")
+    final_reported = payload["traces"][-1].get("reported_marginals")
+    if final_reported is None:
+        raise ValueError("last LLM response has no parsed marginal probabilities")
+    final_reported = np.asarray(final_reported, dtype=np.float64)
+    if final_reported.shape != expected_shape:
+        raise ValueError("last LLM response has an unexpected shape")
+    columns.append(_nearest_alternative(puzzle, final_reported))
+    labels.append("Nearest alternative")
     return np.column_stack(columns), labels
 
 
 def _marginal_metrics(data):
     """Return per-column RMS error and mean Bernoulli KL divergence."""
-    exact = data[:, -2]
+    exact = data[:, -3]
     rms_errors = np.full(data.shape[1], np.nan)
     kl_divergences = np.full(data.shape[1], np.nan)
     epsilon = np.finfo(np.float64).eps
 
-    for column_index in range(1, data.shape[1] - 2):
+    for column_index in range(1, data.shape[1] - 3):
         reported = data[:, column_index]
         if np.any(~np.isfinite(reported)):
             continue
@@ -90,8 +115,7 @@ def _marginal_metrics(data):
             false_terms = np.where(
                 false_exact == 0.0,
                 0.0,
-                false_exact
-                * (np.log(false_exact) - np.log1p(-clipped_reported)),
+                false_exact * (np.log(false_exact) - np.log1p(-clipped_reported)),
             )
         kl_divergences[column_index] = np.mean(true_terms + false_terms)
 
@@ -117,9 +141,8 @@ def main():
 
     # figure_width = max(8.0, 0.75 * data.shape[1])
     # figure_height = max(4.5, 0.45 * data.shape[0])
-    figure_width = 10
+    figure_width = 12
     figure_height = 7
-    plt.ion()
     figure, (marginal_axis, metric_axis) = plt.subplots(
         2,
         1,
@@ -129,16 +152,16 @@ def main():
     )
     colormap = plt.get_cmap("RdBu").copy()
     colormap.set_bad("lightgray")
-    marginal_axis.imshow(data, cmap=colormap, vmin=0, vmax=1, aspect="auto")
+    marginal_axis.imshow(data, cmap=colormap, vmin=-0.1, vmax=1.1, aspect="auto")
     for axis in (marginal_axis, metric_axis):
         axis.axvline(0.5, color="k", linewidth=2)
-        axis.axvline(data.shape[1] - 2.5, color="k", linewidth=2)
+        axis.axvline(data.shape[1] - 3.5, color="k", linewidth=2)
 
     marginal_axis.set_yticks(np.arange(data.shape[0]), labels=variable_labels)
     # axis.set_xlabel("Marginal source / LLM input padding")
     marginal_axis.set_ylabel("Variable")
     marginal_axis.set_title(
-        "P(variable=True): prior, LLM trace, exact marginal, and MAP"
+        "P(variable=True): prior, LLM trace, exact marginal, and solutions"
     )
 
     column_indices = np.arange(data.shape[1])
@@ -155,7 +178,7 @@ def main():
         label="Mean KL divergence",
     )
     metric_axis.set_ylim(0, 1)
-    metric_axis.set_ylabel("Metric value")
+    metric_axis.set_ylabel("Value")
     metric_axis.grid(axis="y", alpha=0.3)
     metric_axis.legend()
     metric_axis.set_xticks(column_indices, labels=column_labels)
@@ -165,7 +188,7 @@ def main():
     # figure.colorbar(image, ax=axis, label="P(variable=True)", fraction=0.01)
     figure.tight_layout()
 
-    plt.show(block=True)
+    plt.show()
 
 
 if __name__ == "__main__":

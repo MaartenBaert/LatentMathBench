@@ -66,6 +66,16 @@ def parse_bool(value):
     raise ValueError("Invalid bool")
 
 
+def parse_marginals(content, variable_count):
+    parts = content.strip().removeprefix("(").removesuffix(")").split(",")
+    if len(parts) != variable_count:
+        raise ValueError(f"expected {variable_count} comma-separated probabilities")
+    values = np.asarray([float(part.strip()) for part in parts], dtype=np.float64)
+    if np.any(~np.isfinite(values)) or np.any((values < 0.0) | (values > 1.0)):
+        raise ValueError("probabilities must be finite and between 0 and 1")
+    return values
+
+
 # Polynomial arithmetic over GF(2). Polynomials are stored as integers.
 def _poly_mod(a, modulus):
     modulus_degree = modulus.bit_length() - 1
@@ -363,6 +373,7 @@ def choose_probabilities(
             return (
                 percentages,
                 solution_array[best_index],
+                exact_marginals,
                 probability_ratio,
                 float(maximum_marginal_map_difference),
             )
@@ -375,7 +386,7 @@ def choose_probabilities(
     )
 
 
-def bch_to_soft_logic(matrix, percentages, rhs):
+def bch_to_soft_logic(matrix, percentages, rhs, phrasing="original"):
     matrix = np.asarray(matrix, dtype=np.uint8)
     percentages = np.asarray(percentages)
     rhs = np.asarray(rhs, dtype=np.uint8)
@@ -396,13 +407,23 @@ def bch_to_soft_logic(matrix, percentages, rhs):
         expression = " xor ".join(variables) if variables else "False"
         checks.append(f"{expression} = {bool(expected)}")
 
-    return (
+    logic = (
         "All variables are boolean.\n\n"
         + priors
         + "\n\nThe following expressions are all correct:\n"
         + "\n".join(checks)
-        + f"\n\nWhat is the most likely value of ({', '.join(names)})?"
     )
+    if phrasing == "original":
+        return logic + f"\n\nWhat is the most likely value of ({', '.join(names)})?"
+    if phrasing == "marginal":
+        return (
+            logic
+            + "\n\nReport the exact marginal probability P(variable=True), conditioned "
+            "on all expressions above, for each variable in this order: "
+            f"({', '.join(names)}). Return exactly one tuple of "
+            f"{len(names)} decimal numbers between 0 and 1."
+        )
+    raise ValueError(f"unsupported phrasing: {phrasing!r}")
 
 
 def run_test(llm, args, variables):
@@ -419,6 +440,7 @@ def run_test(llm, args, variables):
     (
         percentages,
         answer,
+        exact_marginals,
         probability_ratio,
         maximum_marginal_map_difference,
     ) = choose_probabilities(
@@ -430,7 +452,7 @@ def run_test(llm, args, variables):
         args.marginal_min,
         args.marginal_max,
     )
-    logic = bch_to_soft_logic(matrix, percentages, rhs)
+    logic = bch_to_soft_logic(matrix, percentages, rhs, args.phrasing)
 
     lines = ["Answer immediately with one tuple and nothing else.", "", logic]
     if args.input_dots is not None:
@@ -472,10 +494,19 @@ def run_test(llm, args, variables):
 
     correct = False
     alternative = False
+    reported_marginals = None
+    candidate = None
     try:
-        parts = content.strip().removeprefix("(").removesuffix(")").split(",")
-        if len(parts) == variables:
-            candidate = np.array([parse_bool(part) for part in parts], dtype=np.uint8)
+        if args.phrasing == "marginal":
+            reported_marginals = parse_marginals(content, variables)
+            candidate = (reported_marginals >= 0.5).astype(np.uint8)
+        else:
+            parts = content.strip().removeprefix("(").removesuffix(")").split(",")
+            if len(parts) == variables:
+                candidate = np.array(
+                    [parse_bool(part) for part in parts], dtype=np.uint8
+                )
+        if candidate is not None:
             correct = np.array_equal(candidate, answer)
             alternative = np.array_equal(_gf2_matvec(matrix, candidate), rhs)
     except ValueError:
@@ -483,6 +514,8 @@ def run_test(llm, args, variables):
 
     valid = reasoning_tokens == 0
     print(f"Model answer: {content}")
+    if reported_marginals is not None:
+        print(f"Thresholded answer: {tuple(bool(value) for value in candidate)}")
     print(f"Correct answer: {tuple(bool(value) for value in answer)}")
     print(f"Best/second probability ratio: {probability_ratio:.6g}")
     print(
@@ -502,11 +535,18 @@ def run_test(llm, args, variables):
                 "rhs": rhs.copy(),
                 "percentages": percentages.copy(),
                 "correct_answer": answer.copy(),
+                "exact_marginals": exact_marginals.copy(),
                 "probability_ratio": probability_ratio,
                 "maximum_marginal_map_difference": maximum_marginal_map_difference,
                 "logic": logic,
                 "prompt": prompt,
                 "model_answer": content,
+                "reported_marginals": (
+                    None if reported_marginals is None else reported_marginals.copy()
+                ),
+                "thresholded_answer": (
+                    None if candidate is None else candidate.copy()
+                ),
                 "reasoning_tokens": reasoning_tokens,
                 "correct": bool(correct),
                 "valid": bool(valid),
@@ -534,6 +574,7 @@ def run_sample(llm, args, variables):
 
     print(f"Provider:          {args.provider}")
     print(f"Model:             {args.model}")
+    print(f"Phrasing:          {args.phrasing}")
     print(f"Variables:         {variables}")
     print(f"Correctable errors: {args.correctable_errors}")
     print(f"Ratio range:       [{args.ratio_min}, {args.ratio_max}]")
@@ -565,6 +606,12 @@ def main():
     parser.add_argument("--row-mix-candidates", type=int, default=64)
     parser.add_argument("-p", "--provider", type=str, default="openai")
     parser.add_argument("-m", "--model", type=str, default="gpt-5.6-luna")
+    parser.add_argument(
+        "--phrasing",
+        choices=("original", "marginal"),
+        default="original",
+        help="prompt/output phrasing to use (default: original)",
+    )
     parser.add_argument("--horizon", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--input-dots", type=int, default=None)
@@ -655,6 +702,7 @@ def main():
             "benchmark": {
                 "provider": args.provider,
                 "model": args.model,
+                "phrasing": args.phrasing,
                 "ratio_min": args.ratio_min,
                 "ratio_max": args.ratio_max,
                 "marginal_min": args.marginal_min,

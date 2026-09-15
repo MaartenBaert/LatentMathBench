@@ -6,6 +6,7 @@ arbitrary code.
 """
 
 import argparse
+import math
 import pickle
 import re
 import time
@@ -80,9 +81,32 @@ TEST_CASES = {
         "line_number": 3217,
         "input_dots": 3000,
     },
+    "random-correct-14-vars": {
+        "kind": "text",
+        "path": WORKSPACE_ROOT / "rawdump-bch-soft-v1" / "astra-horizon-100dots.txt",
+        "puzzle_block_index": 120,
+        "line_number": 4233,
+        "input_dots": 100,
+    },
+    "random-correct-15-vars": {
+        "kind": "text",
+        "path": WORKSPACE_ROOT / "rawdump-bch-soft-v1" / "astra-horizon-100dots.txt",
+        "puzzle_block_index": 156,
+        "line_number": 5551,
+        "input_dots": 100,
+    },
+    "random-correct-16-vars": {
+        "kind": "text",
+        "path": WORKSPACE_ROOT / "rawdump-bch-soft-v1" / "astra-horizon-300dots.txt",
+        "puzzle_block_index": 40,
+        "line_number": 1261,
+        "input_dots": 300,
+    },
 }
 TEXT_PUZZLE_MARKER = "Answer immediately with one tuple and nothing else.\n\n"
-DOT_STEP = 100
+PREFIX_PADDING_DOTS = 1000
+DEFAULT_STEP_DOTS = 100
+CACHE_SHORTFALL_TOLERANCE = 10
 DEFAULT_OUTPUT = "trace-bch-soft-marginal.pkl"
 
 MARGINAL_SYSTEM_PROMPT = (
@@ -251,9 +275,10 @@ def _load_selected_puzzle(test_case_name):
 
 def _problem_prompt(problem, phrasing):
     question_marker = "\n\nWhat is the most likely value"
-    logic, separator, _ = problem["logic"].partition(question_marker)
+    logic, separator, question_suffix = problem["logic"].partition(question_marker)
     if not separator:
         raise ValueError("could not remove the MAP question from the stored puzzle")
+    question = separator.lstrip() + question_suffix
     variable_names = [chr(ord("a") + index) for index in range(problem["variables"])]
     names = ", ".join(variable_names)
     if phrasing == "marginal":
@@ -285,6 +310,19 @@ def _problem_prompt(problem, phrasing):
             f"correct, as {len(variable_names)} percentage values between 0% and "
             "100%."
         )
+    if phrasing == "confidence-reverse":
+        constraint_marker = "\n\nThe following expressions are all correct:\n"
+        priors, constraint_separator, constraints = logic.partition(constraint_marker)
+        if not constraint_separator:
+            raise ValueError("could not separate priors from constraints")
+        return (
+            "Answer immediately with two tuples and nothing else.\n\n"
+            + question
+            + "\n\nAfter the solution tuple, return a second tuple containing your "
+            "confidence that each corresponding value in the solution tuple is "
+            f"correct, as {len(variable_names)} percentage values between 0% and "
+            "100%.\n\n" + priors + constraint_separator + constraints
+        )
     raise ValueError(f"unsupported phrasing: {phrasing!r}")
 
 
@@ -296,9 +334,12 @@ def _system_prompt(phrasing):
     return ORIGINAL_SYSTEM_PROMPT
 
 
-def _prompt_with_dots(prompt, dot_count):
-    """Match benchmark_bch_soft.py's dot padding exactly."""
-    return prompt + "\n" + ". " * dot_count
+def _dot_message(dot_count):
+    return ". " * dot_count
+
+
+def _initial_prompt(prompt):
+    return _dot_message(PREFIX_PADDING_DOTS) + "\n" + prompt
 
 
 def _response_text(response):
@@ -349,7 +390,7 @@ def _parse_reported_marginals(content, variable_count, phrasing):
         if len(solution) != variable_count:
             raise ValueError(f"expected {variable_count} Boolean values")
         return np.asarray(solution, dtype=np.float64)
-    if phrasing != "confidence":
+    if phrasing not in ("confidence", "confidence-reverse"):
         raise ValueError(f"unsupported phrasing: {phrasing!r}")
 
     match = re.fullmatch(r"\s*(\([^()]*\))\s*,?\s*(\([^()]*\))\s*", content)
@@ -360,6 +401,37 @@ def _parse_reported_marginals(content, variable_count, phrasing):
         raise ValueError(f"expected {variable_count} Boolean values")
     confidences = _parse_percentages(match.group(2), variable_count)
     return np.where(solution, confidences, 1.0 - confidences)
+
+
+def _usage_detail(input_details, name):
+    direct = input_details.get(name)
+    if direct is not None:
+        return int(direct)
+    tier_values = [
+        int(value)
+        for key, value in input_details.items()
+        if key.endswith(f"_{name}") and value is not None
+    ]
+    return sum(tier_values)
+
+
+def _cache_validation(expected_tokens, actual_tokens, status):
+    if expected_tokens is None:
+        return {
+            "status": status,
+            "expected_tokens": None,
+            "actual_tokens": actual_tokens,
+            "shortfall": None,
+            "valid": None,
+        }
+    shortfall = int(expected_tokens) - int(actual_tokens)
+    return {
+        "status": status,
+        "expected_tokens": int(expected_tokens),
+        "actual_tokens": int(actual_tokens),
+        "shortfall": shortfall,
+        "valid": shortfall <= CACHE_SHORTFALL_TOLERANCE,
+    }
 
 
 def _save_trace(filename, payload):
@@ -395,7 +467,13 @@ def main():
     parser.add_argument("-m", "--model", default="gpt-6-astra")
     parser.add_argument(
         "--phrasing",
-        choices=("marginal", "informal", "original", "confidence"),
+        choices=(
+            "marginal",
+            "informal",
+            "original",
+            "confidence",
+            "confidence-reverse",
+        ),
         default="marginal",
         help="prompt/output phrasing to use (default: marginal)",
     )
@@ -409,7 +487,22 @@ def main():
         "--max-dots",
         type=int,
         default=2000,
-        help="largest dot count to test in increments of 100 (default: 2000)",
+        help="largest post-question dot count to test (default: 2000)",
+    )
+    parser.add_argument(
+        "--step-dots",
+        type=int,
+        default=DEFAULT_STEP_DOTS,
+        help=f"dots added per follow-up message (default: {DEFAULT_STEP_DOTS})",
+    )
+    parser.add_argument(
+        "--step-growth",
+        type=float,
+        default=1.0,
+        help=(
+            "geometric growth factor for follow-up step sizes; after each step, "
+            "new_step=floor(step*growth) (default: 1.0)"
+        ),
     )
     parser.add_argument(
         "-o",
@@ -419,10 +512,12 @@ def main():
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if args.max_dots < DOT_STEP:
-        parser.error(f"--max-dots must be at least {DOT_STEP}")
-    if args.max_dots % DOT_STEP:
-        parser.error(f"--max-dots must be a multiple of {DOT_STEP}")
+    if args.max_dots < 0:
+        parser.error("--max-dots must be non-negative")
+    if args.step_dots < 1:
+        parser.error("--step-dots must be positive")
+    if not math.isfinite(args.step_growth) or args.step_growth < 1.0:
+        parser.error("--step-growth must be finite and at least 1.0")
 
     problem, source = _load_selected_puzzle(args.test_case)
     exact_marginals = _exact_marginals(problem)
@@ -437,7 +532,8 @@ def main():
     )
     unpadded_prompt = _problem_prompt(problem, args.phrasing)
     system_prompt = _system_prompt(args.phrasing)
-    first_prompt = _prompt_with_dots(unpadded_prompt, DOT_STEP)
+    initial_prompt = _initial_prompt(unpadded_prompt)
+    messages = [SystemMessage(system_prompt), HumanMessage(initial_prompt)]
 
     payload = {
         "format": "trace_bch_soft_marginal",
@@ -450,8 +546,11 @@ def main():
             "reasoning_effort": _model_kwargs(args.model).get("reasoning_effort"),
             "max_output_tokens": 200,
             "max_dots": args.max_dots,
-            "dot_step": DOT_STEP,
-            "explicit_prompt_caching": False,
+            "prefix_padding_dots": PREFIX_PADDING_DOTS,
+            "step_dots": args.step_dots,
+            "step_growth": args.step_growth,
+            "prompt_cache_options": {"mode": "implicit"},
+            "cache_shortfall_tolerance": CACHE_SHORTFALL_TOLERANCE,
             "dry_run": args.dry_run,
         },
         "puzzle": {
@@ -472,7 +571,7 @@ def main():
             "logic": problem["logic"],
             "system_prompt": system_prompt,
             "unpadded_trace_prompt": unpadded_prompt,
-            "trace_prompt": first_prompt,
+            "trace_prompt": initial_prompt,
         },
         "traces": [],
     }
@@ -488,7 +587,11 @@ def main():
         )
     print(f"Prior-to-marginal flips: {flip_indices.tolist()}")
     print(f"Exact marginals: {tuple(float(value) for value in exact_marginals)}")
-    print(f"Dot counts: {DOT_STEP}, {2 * DOT_STEP}, ... {args.max_dots}")
+    print(f"Prefix padding: {PREFIX_PADDING_DOTS} dots")
+    print(
+        f"Post-question dot counts: 0 to {args.max_dots}; initial step "
+        f"{args.step_dots}, growth {args.step_growth}"
+    )
     print(f"Reasoning effort: {_model_kwargs(args.model).get('reasoning_effort')}")
     print(f"Output: {args.output}")
     print()
@@ -499,14 +602,17 @@ def main():
             model_provider=args.provider,
             model=args.model,
             max_tokens=200,
+            prompt_cache_options={"mode": "implicit"},
             **_model_kwargs(args.model),
         )
 
-    for request_index, total_dots in enumerate(
-        range(DOT_STEP, args.max_dots + 1, DOT_STEP)
-    ):
-        prompt = _prompt_with_dots(unpadded_prompt, total_dots)
-        messages = [SystemMessage(system_prompt), HumanMessage(prompt)]
+    previous_input_tokens = None
+    request_index = 0
+    total_dots = 0
+    step_dots = args.step_dots
+    while True:
+        if request_index:
+            messages.append(HumanMessage(_dot_message(added_dots)))
 
         started = time.monotonic()
         if args.dry_run:
@@ -518,6 +624,9 @@ def main():
             valid_no_reasoning = None
             reported_marginals = None
             parse_error = "dry run"
+            cache_read_tokens = 0
+            cache_creation_tokens = 0
+            cache_validation = _cache_validation(None, 0, "not_checked")
         else:
             while True:
                 try:
@@ -534,7 +643,10 @@ def main():
             content = _response_text(response)
             response_metadata = dict(response.response_metadata)
             usage_metadata = dict(response.usage_metadata or {})
+            input_details = usage_metadata.get("input_token_details", {})
             output_details = usage_metadata.get("output_token_details", {})
+            cache_read_tokens = _usage_detail(input_details, "cache_read")
+            cache_creation_tokens = _usage_detail(input_details, "cache_creation")
             reasoning_tokens = int(output_details.get("reasoning", 0) or 0)
             valid_no_reasoning = reasoning_tokens == 0
             try:
@@ -548,10 +660,24 @@ def main():
 
         elapsed_seconds = time.monotonic() - started
         input_tokens = usage_metadata.get("input_tokens")
+        if args.dry_run:
+            pass
+        elif previous_input_tokens is None:
+            cache_validation = _cache_validation(
+                input_tokens,
+                max(cache_read_tokens, cache_creation_tokens),
+                "initial_cache_write",
+            )
+        else:
+            cache_validation = _cache_validation(
+                previous_input_tokens,
+                cache_read_tokens,
+                "cache_read",
+            )
         record = {
             "request_index": request_index,
             "total_dots": total_dots,
-            "prompt": prompt,
+            "user_messages": tuple(message.content for message in messages[1:]),
             "response_repr": response_repr,
             "raw_response": content,
             "reported_marginals": reported_marginals,
@@ -560,6 +686,9 @@ def main():
             "usage_metadata": usage_metadata,
             "reasoning_tokens": reasoning_tokens,
             "valid_no_reasoning": valid_no_reasoning,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+            "cache_validation": cache_validation,
             "elapsed_seconds": elapsed_seconds,
         }
         payload["traces"].append(record)
@@ -567,14 +696,33 @@ def main():
 
         print(
             f"dots={total_dots}: input_tokens={input_tokens}, "
+            f"cached_tokens={cache_read_tokens}, "
+            f"cache_creation_tokens={cache_creation_tokens}, "
             f"reasoning_tokens={reasoning_tokens}"
         )
+        if cache_validation["valid"] is False:
+            print(
+                "WARNING: cache token shortfall is "
+                f"{cache_validation['shortfall']} tokens; expected approximately "
+                f"{cache_validation['expected_tokens']}, got "
+                f"{cache_validation['actual_tokens']}"
+            )
         print(f"response={content}")
         if parse_error is not None:
             print(f"parse_error={parse_error}")
         if valid_no_reasoning is False:
             print("INVALID: response used reasoning tokens")
         print()
+
+        if input_tokens is not None:
+            previous_input_tokens = int(input_tokens)
+
+        if total_dots + step_dots > args.max_dots:
+            break
+        added_dots = step_dots
+        total_dots += added_dots
+        step_dots = math.floor(step_dots * args.step_growth)
+        request_index += 1
 
 
 if __name__ == "__main__":
