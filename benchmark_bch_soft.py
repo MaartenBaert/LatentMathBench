@@ -2,6 +2,7 @@ import argparse
 import itertools
 import math
 import pickle
+import re
 import time
 
 import numpy as np
@@ -74,6 +75,34 @@ def parse_marginals(content, variable_count):
     if np.any(~np.isfinite(values)) or np.any((values < 0.0) | (values > 1.0)):
         raise ValueError("probabilities must be finite and between 0 and 1")
     return values
+
+
+def parse_percentages(content, variable_count):
+    parts = content.strip().removeprefix("(").removesuffix(")").split(",")
+    if len(parts) != variable_count:
+        raise ValueError(f"expected {variable_count} comma-separated percentages")
+    values = np.asarray(
+        [float(part.strip().removesuffix("%").strip()) for part in parts],
+        dtype=np.float64,
+    )
+    if np.any(~np.isfinite(values)) or np.any((values < 0.0) | (values > 100.0)):
+        raise ValueError("percentages must be finite and between 0 and 100")
+    return values / 100.0
+
+
+def parse_confidence_response(content, variable_count):
+    match = re.fullmatch(r"\s*(\([^()]*\))\s*,?\s*(\([^()]*\))\s*", content)
+    if match is None:
+        raise ValueError("expected a Boolean tuple followed by a confidence tuple")
+
+    solution_parts = match.group(1).removeprefix("(").removesuffix(")").split(",")
+    if len(solution_parts) != variable_count:
+        raise ValueError(f"expected {variable_count} Boolean values")
+    solution = np.asarray(
+        [parse_bool(part) for part in solution_parts], dtype=np.uint8
+    )
+    confidences = parse_percentages(match.group(2), variable_count)
+    return solution, confidences
 
 
 # Polynomial arithmetic over GF(2). Polynomials are stored as integers.
@@ -423,6 +452,15 @@ def bch_to_soft_logic(matrix, percentages, rhs, phrasing="original"):
             f"({', '.join(names)}). Return exactly one tuple of "
             f"{len(names)} decimal numbers between 0 and 1."
         )
+    if phrasing == "confidence-reverse":
+        return (
+            f"What is the most likely value of ({', '.join(names)})?"
+            + "\n\nAfter the solution tuple, return a second tuple containing your "
+            "confidence that each corresponding value in the solution tuple is "
+            f"correct, as {len(names)} percentage values between 0% and 100%."
+            + "\n\n"
+            + logic
+        )
     raise ValueError(f"unsupported phrasing: {phrasing!r}")
 
 
@@ -454,7 +492,10 @@ def run_test(llm, args, variables):
     )
     logic = bch_to_soft_logic(matrix, percentages, rhs, args.phrasing)
 
-    lines = ["Answer immediately with one tuple and nothing else.", "", logic]
+    tuple_request = (
+        "two tuples" if args.phrasing == "confidence-reverse" else "one tuple"
+    )
+    lines = [f"Answer immediately with {tuple_request} and nothing else.", "", logic]
     if args.input_dots is not None:
         lines.append(". " * args.input_dots)
     prompt = "\n".join(lines)
@@ -490,16 +531,26 @@ def run_test(llm, args, variables):
 
         details = response.usage_metadata.get("output_token_details", {})
         reasoning_tokens = details.get("reasoning", 0)
-        reasoning_tokens += max(0, response.usage_metadata["output_tokens"] - 80)
+        reasoning_tokens += max(
+            0, response.usage_metadata["output_tokens"] - (args.max_output_tokens - 20)
+        )
 
     correct = False
     alternative = False
+    reported_confidences = None
     reported_marginals = None
     candidate = None
     try:
         if args.phrasing == "marginal":
             reported_marginals = parse_marginals(content, variables)
             candidate = (reported_marginals >= 0.5).astype(np.uint8)
+        elif args.phrasing == "confidence-reverse":
+            candidate, reported_confidences = parse_confidence_response(
+                content, variables
+            )
+            reported_marginals = np.where(
+                candidate, reported_confidences, 1.0 - reported_confidences
+            )
         else:
             parts = content.strip().removeprefix("(").removesuffix(")").split(",")
             if len(parts) == variables:
@@ -514,7 +565,16 @@ def run_test(llm, args, variables):
 
     valid = reasoning_tokens == 0
     print(f"Model answer: {content}")
+    if reported_confidences is not None:
+        print(
+            "Reported confidences: "
+            f"{tuple(float(value) for value in reported_confidences)}"
+        )
     if reported_marginals is not None:
+        print(
+            "Reported marginals: "
+            f"{tuple(float(value) for value in reported_marginals)}"
+        )
         print(f"Thresholded answer: {tuple(bool(value) for value in candidate)}")
     print(f"Correct answer: {tuple(bool(value) for value in answer)}")
     print(f"Best/second probability ratio: {probability_ratio:.6g}")
@@ -541,6 +601,11 @@ def run_test(llm, args, variables):
                 "logic": logic,
                 "prompt": prompt,
                 "model_answer": content,
+                "reported_confidences": (
+                    None
+                    if reported_confidences is None
+                    else reported_confidences.copy()
+                ),
                 "reported_marginals": (
                     None if reported_marginals is None else reported_marginals.copy()
                 ),
@@ -608,7 +673,7 @@ def main():
     parser.add_argument("-m", "--model", type=str, default="gpt-5.6-luna")
     parser.add_argument(
         "--phrasing",
-        choices=("original", "marginal"),
+        choices=("original", "marginal", "confidence-reverse"),
         default="original",
         help="prompt/output phrasing to use (default: original)",
     )
@@ -624,6 +689,7 @@ def main():
     parser.add_argument("--hi", type=int, default=None)
     args = parser.parse_args()
     args.dump_records = []
+    args.max_output_tokens = 200 if args.phrasing == "confidence-reverse" else 100
 
     if not 2 <= args.variables <= 21:
         parser.error("--variables must be between 2 and 21")
@@ -647,6 +713,7 @@ def main():
         kwargs["reasoning_effort"] = "minimal"
     elif args.model in (
         "gpt-6-astra",
+        "gpt-6.1-sol",
         "claude-opus-4-5",
         "claude-sonnet-4-6",
         "claude-opus-4-6",
@@ -665,7 +732,7 @@ def main():
         else init_chat_model(
             model_provider=args.provider,
             model=args.model,
-            max_tokens=100,
+            max_tokens=args.max_output_tokens,
             **kwargs,
         )
     )
@@ -703,6 +770,7 @@ def main():
                 "provider": args.provider,
                 "model": args.model,
                 "phrasing": args.phrasing,
+                "max_output_tokens": args.max_output_tokens,
                 "ratio_min": args.ratio_min,
                 "ratio_max": args.ratio_max,
                 "marginal_min": args.marginal_min,

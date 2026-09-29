@@ -717,6 +717,7 @@ def main():
         kwargs["reasoning_effort"] = "minimal"
     elif args.model in (
         "gpt-6-astra",
+        "gpt-6.1-sol",
         "claude-opus-4-5",
         "claude-sonnet-4-6",
         "claude-opus-4-6",
